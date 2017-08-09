@@ -27,7 +27,7 @@ from netmiko import ConnectHandler, FileTransfer, InLineTransfer
 from netmiko import __version__ as netmiko_version
 from napalm_base.base import NetworkDriver
 from napalm_base.exceptions import ReplaceConfigException, MergeConfigException, \
-            ConnectionClosedException, CommandErrorException
+            ConnectionClosedException
 
 from napalm_base.utils import py23_compat
 import napalm_base.constants as C
@@ -83,7 +83,7 @@ class IOSDriver(NetworkDriver):
         self.inline_transfer = optional_args.get('inline_transfer', False)
 
         # None will cause autodetection of dest_file_system
-        self._dest_file_system = optional_args.get('dest_file_system', None)
+        self.dest_file_system = optional_args.get('dest_file_system', None)
         self.auto_rollback_on_error = optional_args.get('auto_rollback_on_error', True)
 
         # Netmiko possible arguments
@@ -135,14 +135,12 @@ class IOSDriver(NetworkDriver):
                                      **self.netmiko_optional_args)
         # ensure in enable mode
         self.device.enable()
-
-    def _discover_file_system(self):
-        try:
-            return self.device._autodetect_fs()
-        except Exception:
-            msg = "Netmiko _autodetect_fs failed (to workaround specify " \
-                  "dest_file_system in optional_args.)"
-            raise CommandErrorException(msg)
+        if not self.dest_file_system:
+            try:
+                self.dest_file_system = self.device._autodetect_fs()
+            except AttributeError:
+                raise AttributeError("Netmiko _autodetect_fs not found please upgrade Netmiko or "
+                                     "specify dest_file_system in optional_args.")
 
     def close(self):
         """Close the connection to the device."""
@@ -169,15 +167,16 @@ class IOSDriver(NetworkDriver):
         """Returns a flag with the state of the SSH connection."""
         null = chr(0)
         try:
-            if self.device is None:
-                return {'is_alive': False}
-            else:
-                # Try sending ASCII null byte to maintain the connection alive
-                self.device.send_command(null)
+            # Try sending ASCII null byte to maintain
+            #   the connection alive
+            self.device.send_command(null)
         except (socket.error, EOFError):
-            # If unable to send, we can tell for sure that the connection is unusable,
-            # hence return False.
-            return {'is_alive': False}
+            # If unable to send, we can tell for sure
+            #   that the connection is unusable,
+            #   hence return False.
+            return {
+                'is_alive': False
+            }
         return {
             'is_alive': self.device.remote_conn.transport.is_active()
         }
@@ -412,8 +411,7 @@ class IOSDriver(NetworkDriver):
             self._enable_confirm()
             if 'Invalid input detected' in output:
                 self.rollback()
-                err_header = "Configuration merge failed; automatic rollback attempted"
-                merge_error = "{0}:\n{1}".format(err_header, output)
+                merge_error = "Configuration merge failed; automatic rollback attempted"
                 raise MergeConfigException(merge_error)
 
         # Save config to startup (both replace and merge)
@@ -861,7 +859,10 @@ class IOSDriver(NetworkDriver):
                 _, serial_number = line.split("Processor board ID ")
                 serial_number = serial_number.strip()
 
-            if re.search(r"Cisco IOS Software", line):
+            if re.search(r"Cisco IOS XE Software", line):
+                _, xe_version = line.split("Cisco IOS XE Software, ")
+                xe_version = xe_version.strip()
+            elif re.search(r"Cisco IOS Software", line):
                 try:
                     _, os_version = line.split("Cisco IOS Software, ")
                 except ValueError:
@@ -871,6 +872,9 @@ class IOSDriver(NetworkDriver):
             elif re.search(r"IOS (tm).+Software", line):
                 _, os_version = line.split("IOS (tm) ")
                 os_version = os_version.strip()
+
+        if xe_version != '':
+            os_version = xe_version + " " + os_version
 
         # Determine domain_name and fqdn
         for line in show_hosts.splitlines():
@@ -1776,9 +1780,7 @@ class IOSDriver(NetworkDriver):
         RE_MACTABLE_DEFAULT = r"^" + MAC_REGEX
         RE_MACTABLE_6500_1 = r"^\*\s+{}\s+{}\s+".format(VLAN_REGEX, MAC_REGEX)  # 7 fields
         RE_MACTABLE_6500_2 = r"^{}\s+{}\s+".format(VLAN_REGEX, MAC_REGEX)   # 6 fields
-        RE_MACTABLE_6500_3 = r"^\s{51}\S+"                               # Fill down from prior
-        RE_MACTABLE_4500_1 = r"^{}\s+{}\s+".format(VLAN_REGEX, MAC_REGEX)     # 5 fields
-        RE_MACTABLE_4500_2 = r"^\s{32}\S+"                               # Fill down from prior
+        RE_MACTABLE_4500 = r"^{}\s+{}\s+".format(VLAN_REGEX, MAC_REGEX)     # 5 fields
         RE_MACTABLE_2960_1 = r"^All\s+{}".format(MAC_REGEX)
         RE_MACTABLE_GEN_1 = r"^{}\s+{}\s+".format(VLAN_REGEX, MAC_REGEX)   # 4 fields (2960/4500)
 
@@ -1816,21 +1818,7 @@ class IOSDriver(NetworkDriver):
         output = "\n".join(output).strip()
         # Strip any leading astericks
         output = re.sub(r"^\*", "", output, flags=re.M)
-        fill_down_vlan = fill_down_mac = fill_down_mac_type = ''
         for line in output.splitlines():
-            # Cat6500 one off anf 4500 multicast format
-            if (re.search(RE_MACTABLE_6500_3, line) or re.search(RE_MACTABLE_4500_2, line)):
-                interface = line.strip()
-                if ',' in interface:
-                    interfaces = interface.split(',')
-                else:
-                    interfaces = []
-                    interfaces.append(interface)
-                for single_interface in interfaces:
-                    mac_address_table.append(process_mac_fields(fill_down_vlan, fill_down_mac,
-                                                                fill_down_mac_type,
-                                                                single_interface))
-                continue
             line = line.strip()
             if line == '':
                 continue
@@ -1852,18 +1840,9 @@ class IOSDriver(NetworkDriver):
                     _, vlan, mac, mac_type, _, _, interface = line.split()
                 elif len(line.split()) == 6:
                     vlan, mac, mac_type, _, _, interface = line.split()
-                if ',' in interface:
-                    interfaces = interface.split(',')
-                    fill_down_vlan = vlan
-                    fill_down_mac = mac
-                    fill_down_mac_type = mac_type
-                    for single_interface in interfaces:
-                        mac_address_table.append(process_mac_fields(vlan, mac, mac_type,
-                                                                    single_interface))
-                else:
-                    mac_address_table.append(process_mac_fields(vlan, mac, mac_type, interface))
+                mac_address_table.append(process_mac_fields(vlan, mac, mac_type, interface))
             # Cat4500 format
-            elif re.search(RE_MACTABLE_4500_1, line) and len(line.split()) == 5:
+            elif re.search(RE_MACTABLE_4500, line) and len(line.split()) == 5:
                 vlan, mac, mac_type, _, interface = line.split()
                 mac_address_table.append(process_mac_fields(vlan, mac, mac_type, interface))
             # Cat2960 format - ignore extra header line
@@ -1873,16 +1852,7 @@ class IOSDriver(NetworkDriver):
             elif (re.search(RE_MACTABLE_2960_1, line) or re.search(RE_MACTABLE_GEN_1, line)) and \
                     len(line.split()) == 4:
                 vlan, mac, mac_type, interface = line.split()
-                if ',' in interface:
-                    interfaces = interface.split(',')
-                    fill_down_vlan = vlan
-                    fill_down_mac = mac
-                    fill_down_mac_type = mac_type
-                    for single_interface in interfaces:
-                        mac_address_table.append(process_mac_fields(vlan, mac, mac_type,
-                                                                    single_interface))
-                else:
-                    mac_address_table.append(process_mac_fields(vlan, mac, mac_type, interface))
+                mac_address_table.append(process_mac_fields(vlan, mac, mac_type, interface))
             elif re.search(r"Total Mac Addresses", line):
                 continue
             elif re.search(r"Multicast Entries", line):
@@ -2164,10 +2134,3 @@ class IOSDriver(NetworkDriver):
             configs['running'] = output
 
         return configs
-
-    @property
-    def dest_file_system(self):
-        # The self.device check ensures napalm has an open connection
-        if self.device and self._dest_file_system is None:
-            self._dest_file_system = self._discover_file_system()
-        return self._dest_file_system
