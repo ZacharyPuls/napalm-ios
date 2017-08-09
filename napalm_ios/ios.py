@@ -841,6 +841,7 @@ class IOSDriver(NetworkDriver):
         # default values.
         vendor = u'Cisco'
         uptime = -1
+        xe_version = ''
         serial_number, fqdn, os_version, hostname = (u'Unknown', u'Unknown', u'Unknown', u'Unknown')
 
         # obtain output from device
